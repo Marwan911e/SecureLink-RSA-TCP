@@ -131,6 +131,95 @@ sequenceDiagram
 
 ---
 
+## 5.3 Code walkthrough (flow logic from start to finish)
+
+This section explains the code in the exact order you run it in real life, and shows how each class calls the next logical step.
+
+### Step A — Generate keys (run first): `java RSAGenKey`
+
+**Goal:** create RSA key pairs for Sender (A) and Receiver (B), and write them to disk.
+
+Execution flow:
+1) `RSAGenKey.main(...)` prints the configured RSA key size (`RSAKeyUtil.KEY_SIZE`).
+2) It calls `RSAKeyUtil.generateKeyPair()` twice:
+   - once for the sender (A)
+   - once for the receiver (B)
+3) Each `KeyPair` is stored via `RSAKeyUtil.saveKeyPair(pair, prefix)`.
+
+What `RSAKeyUtil.saveKeyPair(...)` does:
+- ensures `keys/` exists (`Files.createDirectories`)
+- writes two files per identity:
+  - `keys/<prefix>_private.key` (Base64-encoded PKCS#8 private key)
+  - `keys/<prefix>_public.key` (Base64-encoded X.509 public key)
+
+This step produces the artifacts that both networking programs depend on.
+
+### Step B — Start the receiver server (run second): `java RSADecrypt`
+
+**Goal:** listen for one TCP client, receive a single ciphertext message, decrypt, and print.
+
+Execution flow:
+1) `RSADecrypt.main(args)` decides the mode:
+   - `RSAKeyUtil.isDoubleMode(args)` returns `true` if `--double` is present, otherwise `false`.
+2) It decides the port via `parsePort(args)` (default `54321`).
+3) It loads keys from `keys/`:
+   - receiver private key: `RSAKeyUtil.loadPrivateKey("receiver")` → needed for confidentiality decryption
+   - sender public key: `RSAKeyUtil.loadPublicKey("sender")` → needed only in double mode (inner verification layer)
+4) It opens the server socket:
+   - `new ServerSocket(port)`
+   - blocks on `accept()` until a client connects
+5) It reads ciphertext from the socket using `readFramed(in)`:
+   - reads a 4-byte `int length`
+   - validates length (basic safety)
+   - reads exactly `length` bytes
+6) It chooses the correct decryption routine:
+   - single mode: `decryptSingle(ciphertext, receiverPrivate)`
+   - double mode: `decryptDouble(ciphertext, receiverPrivate, senderPublic)`
+7) It converts plaintext bytes to UTF-8 and prints.
+
+Single decryption (confidentiality only):
+- `decryptSingle(...)` creates a `Cipher` using `RSAKeyUtil.CIPHER_PKCS1` (`RSA/ECB/PKCS1Padding`)
+- initializes with receiver private key (`Cipher.DECRYPT_MODE`)
+- runs `doFinal(ciphertext)` to produce plaintext bytes
+
+Double decryption (reverse of client’s double encryption):
+1) Step 1: `RSA/ECB/NoPadding` with receiver private key → removes the outer confidentiality layer
+2) Step 2: `RSA/ECB/PKCS1Padding` with sender public key → removes/verifies the inner layer and yields plaintext
+
+### Step C — Run the sender client (run last): `java RSAEncrypt`
+
+**Goal:** read plaintext from a file, encrypt according to mode, connect to the server, send one ciphertext message.
+
+Execution flow:
+1) `RSAEncrypt.main(args)` decides the mode via `RSAKeyUtil.isDoubleMode(args)`.
+2) It reads networking parameters:
+   - host via `parseOption(args, "--host", "localhost")`
+   - port via `parsePort(args)` (default `54321`)
+3) It loads keys from `keys/`:
+   - sender private key: `RSAKeyUtil.loadPrivateKey("sender")` (needed only in double mode inner layer)
+   - receiver public key: `RSAKeyUtil.loadPublicKey("receiver")` (confidentiality)
+4) It loads plaintext via `loadPlaintext()`:
+   - reads `name.txt`
+   - trims/pads to exactly 10 characters
+5) It converts plaintext to bytes (`UTF-8`).
+6) It encrypts:
+   - single mode: `encryptSingle(plaintextBytes, receiverPublic)`
+   - double mode: `encryptDouble(plaintextBytes, senderPrivate, receiverPublic)`
+7) It opens a TCP socket to the receiver and writes a framed message:
+   - `out.writeInt(ciphertext.length)`
+   - `out.write(ciphertext)`
+
+Single encryption:
+- `encryptSingle(...)` uses `RSA/ECB/PKCS1Padding` with the receiver public key.
+
+Double encryption (two-stage):
+1) Inner: `RSA/ECB/PKCS1Padding` with sender private key
+2) Outer: `RSA/ECB/NoPadding` with receiver public key
+
+At this point, the receiver’s `readFramed(...)` reads the same length+bytes, and its decryption reverses the sender’s encryption steps.
+
+---
+
 ## 6) Network protocol (framing)
 TCP is a byte stream, so the receiver needs a clear message boundary. This project uses **length-prefix framing**:
 
